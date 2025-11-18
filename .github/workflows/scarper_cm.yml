@@ -1,0 +1,40 @@
+name: Scraper ChileCompra Supabase
+
+on:
+  # Se ejecuta automáticamente todos los días a las 6:00 AM UTC
+  schedule:
+    - cron: '0 6 * * *'
+  # Permite ejecutarlo manualmente desde la pestaña Actions
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # Evita que se cuelgue infinitamente (ajusta según necesites)
+
+    steps:
+      - name: 1. Obtener el código del repositorio
+        uses: actions/checkout@v3
+
+      - name: 2. Configurar Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip' # Cachea las librerías para que sea más rápido
+
+      - name: 3. Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. Ejecutar Scraper de Lista (Genera la base)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python proyectoMP.py
+
+      - name: 5. Ejecutar Scraper de Detalles (Extrae precios)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python proyectoMPlvl2.py
