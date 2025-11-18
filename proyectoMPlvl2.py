@@ -6,9 +6,10 @@ import unicodedata
 import requests
 import pandas as pd
 from supabase import create_client, Client
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def get_supabase_client() -> Client:
+def get_supabase_client():
     """
     Crea el cliente de Supabase usando SUPABASE_URL y SUPABASE_KEY
     desde variables de entorno.
@@ -22,14 +23,14 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 
-def extract_json_object_by_key(html_content: str, key_name: str):
+def extract_json_object_by_key(html_content, key_name):
     """
     Extrae un objeto JSON desde HTML buscando una clave (por ejemplo 'jsonResult')
     y encontrando la llave de cierre correspondiente.
     """
     idx_key = html_content.find(key_name)
     if idx_key == -1:
-        idx_key = html_content.find(f'"{key_name}"')
+        idx_key = html_content.find('"{}"'.format(key_name))
     if idx_key == -1:
         return None
 
@@ -70,7 +71,7 @@ def extract_json_object_by_key(html_content: str, key_name: str):
     return None
 
 
-def extract_product_id(html_content: str) -> str | None:
+def extract_product_id(html_content):
     """
     Extrae el productId principal necesario para buscar ofertas en offerPrices.
     """
@@ -80,19 +81,18 @@ def extract_product_id(html_content: str) -> str | None:
     return None
 
 
-def clean_column_name(region_name: str) -> str:
+def clean_column_name(region_name):
     """
-    Normaliza nombres de región (por si quisieras columnas tipo 'Precio_Region').
-    Se mantiene por compatibilidad, aunque ahora usamos JSON en la BD.
+    Normaliza nombres de región (por compatibilidad con columnas tipo 'Precio_Region').
     """
     nfkd_form = unicodedata.normalize("NFKD", region_name)
     cleaned = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
     cleaned = cleaned.replace("Region de ", "").replace("Region del ", "")
     cleaned = cleaned.replace(" ", "_").replace("-", "_").replace(".", "")
-    return f"Precio_{cleaned}"
+    return "Precio_{}".format(cleaned)
 
 
-def clean_price_value(value) -> int:
+def clean_price_value(value):
     """
     Convierte un string de precio (ej: '15,167.00') a entero (15167).
     """
@@ -110,12 +110,7 @@ def clean_price_value(value) -> int:
         return 0
 
 
-def get_minimum_price_by_region_with_offers(
-    json_prices: dict,
-    offer_prices: dict | None,
-    product_id: str | None,
-    region_names_map: dict,
-) -> dict:
+def get_minimum_price_by_region_with_offers(json_prices, offer_prices, product_id, region_names_map):
     """
     Calcula precio mínimo por región, priorizando 'special_price' de offerPrices
     si está disponible.
@@ -123,16 +118,16 @@ def get_minimum_price_by_region_with_offers(
     if not json_prices:
         return {}
 
-    precios_finales: dict = {}
+    precios_finales = {}
 
     # json_prices tiene keys = IDs de región
     for region_id, providers in json_prices.items():
-        nombre_region_real = region_names_map.get(region_id, f"Region_ID_{region_id}")
+        nombre_region_real = region_names_map.get(region_id, "Region_ID_{}".format(region_id))
 
         if not isinstance(providers, dict):
             continue
 
-        lista_precios: list[int] = []
+        lista_precios = []
 
         for provider_id, data in providers.items():
             if not isinstance(data, dict):
@@ -154,9 +149,7 @@ def get_minimum_price_by_region_with_offers(
                             if region_offer:
                                 special_price_raw = region_offer.get("special_price")
                                 if special_price_raw:
-                                    special_price = clean_price_value(
-                                        special_price_raw
-                                    )
+                                    special_price = clean_price_value(special_price_raw)
                                     if special_price > 0:
                                         price_final = special_price
                 except Exception:
@@ -172,12 +165,94 @@ def get_minimum_price_by_region_with_offers(
     return precios_finales
 
 
-def process_products_with_prices(max_products: int = 3):
+def process_one_product(row, headers, total_count):
     """
-    Función principal:
+    Procesa un producto individual:
+    - hace request a la ficha,
+    - obtiene jsonResult y offerPrices,
+    - calcula precios mínimos por región,
+    - retorna un dict listo para guardar en Supabase.
+    """
+    idx = row.get("_index", 0)
+    producto_id_csv = row.get("id_producto")
+    nombre = row.get("nombre_producto", "")
+    link = row.get("link_producto", "")
+
+    # Parseo seguro de número de proveedores
+    try:
+        raw_prov = row.get("numero_proveedores", 0)
+        if pd.isna(raw_prov):
+            num_providers = 0
+        else:
+            num_providers = int(float(raw_prov))
+    except Exception:
+        num_providers = 0
+
+    print("[{}/{}] ID: {} | {}...".format(idx, total_count, producto_id_csv, nombre[:30]))
+
+    try:
+        response = requests.get(link, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(" ⚠ Error HTTP {} para ID {}".format(response.status_code, producto_id_csv))
+            time.sleep(0.2)
+            return None
+
+        html = response.text
+
+        # 1. Metadatos de regiones
+        region_names_map = extract_json_object_by_key(html, "region_names")
+        if not region_names_map:
+            region_names_map = extract_json_object_by_key(html, "regionMapping") or {}
+
+        product_id_internal = extract_product_id(html)
+
+        # 2. Datos de precios
+        json_prices = extract_json_object_by_key(html, "jsonResult")
+        offer_prices = extract_json_object_by_key(html, "offerPrices")
+
+        if json_prices:
+            # 3. Cálculo de precios por región (incluyendo ofertas)
+            precios_region = get_minimum_price_by_region_with_offers(
+                json_prices,
+                offer_prices,
+                product_id_internal,
+                region_names_map,
+            )
+
+            if precios_region:
+                precio_global = int(min(precios_region.values()))
+                mejor_region = min(precios_region, key=precios_region.get)
+                print(" ✓ Mínimo encontrado para {}: ${} ({})".format(producto_id_csv, precio_global, mejor_region))
+
+                row_data = {
+                    "id_producto": str(producto_id_csv),
+                    "nombre_producto": nombre,
+                    "numero_proveedores": num_providers,
+                    "link_producto": link,
+                    "precio_minimo_global": precio_global,
+                    "region_mejor_precio": mejor_region,
+                    # JSON con precios por región: { "Region Metropolitana": 1234, ... }
+                    "precios_region": precios_region,
+                }
+
+                time.sleep(0.2)
+                return row_data
+            else:
+                print(" ⚠ Sin precios válidos encontrados para ID {}".format(producto_id_csv))
+        else:
+            print(" ⚠ No se encontró jsonResult para ID {}".format(producto_id_csv))
+
+    except Exception as e:
+        print(" ✗ Error procesando ID {}: {}".format(producto_id_csv, e))
+
+    time.sleep(0.2)
+    return None
+
+
+def process_products_with_prices(max_products=3, max_workers=8):
+    """
     - Lee productos desde cm_productos en Supabase.
-    - Para cada producto obtiene jsonResult y offerPrices.
-    - Calcula precios mínimos por región.
+    - Procesa en paralelo con ThreadPoolExecutor.
     - Guarda resumen en cm_precios_minimos (Supabase).
     """
     print("=" * 70)
@@ -186,7 +261,7 @@ def process_products_with_prices(max_products: int = 3):
 
     supabase = get_supabase_client()
 
-    # Leer productos desde cm_productos
+    # Leer productos desde cm_productos (limitado por max_products)
     resp = (
         supabase.table("cm_productos")
         .select("id_producto,nombre_producto,numero_proveedores,link_producto")
@@ -198,9 +273,13 @@ def process_products_with_prices(max_products: int = 3):
         print("✗ No se encontraron productos en cm_productos.")
         return None
 
-    df = pd.DataFrame(resp.data)
-    df_test = df  # ya viene limitado por .limit()
-    print(f"✓ Procesando {len(df_test)} productos...\n")
+    rows = resp.data
+    total_count = len(rows)
+    print("✓ Procesando {} productos...\n".format(total_count))
+
+    # Añadir índice 1..N para logs
+    for idx, row in enumerate(rows, start=1):
+        row["_index"] = idx
 
     headers = {
         "User-Agent": (
@@ -210,107 +289,47 @@ def process_products_with_prices(max_products: int = 3):
         )
     }
 
-    resultados: list[dict] = []
+    resultados = []
 
-    for idx, row in df_test.iterrows():
-        producto_id_csv = row["id_producto"]
-        nombre = row["nombre_producto"]
-        link = row["link_producto"]
+    # Paralelización con ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_one_product, row, headers, total_count)
+            for row in rows
+        ]
 
-        # Parseo seguro de número de proveedores
-        try:
-            raw_prov = row.get("numero_proveedores", 0)
-            if pd.isna(raw_prov):
-                num_providers = 0
-            else:
-                num_providers = int(float(raw_prov))
-        except Exception:
-            num_providers = 0
-
-        print(f"[{idx + 1}/{len(df_test)}] ID: {producto_id_csv} | {nombre[:30]}...")
-
-        try:
-            response = requests.get(link, headers=headers, timeout=30)
-            if response.status_code != 200:
-                print(f" ⚠ Error HTTP {response.status_code}")
-                continue
-
-            html = response.text
-
-            # 1. Metadatos de regiones
-            region_names_map = extract_json_object_by_key(html, "region_names")
-            if not region_names_map:
-                region_names_map = (
-                    extract_json_object_by_key(html, "regionMapping") or {}
-                )
-
-            product_id_internal = extract_product_id(html)
-
-            # 2. Datos de precios
-            json_prices = extract_json_object_by_key(html, "jsonResult")
-            offer_prices = extract_json_object_by_key(html, "offerPrices")
-
-            if json_prices:
-                # 3. Cálculo de precios por región (incluyendo ofertas)
-                precios_region = get_minimum_price_by_region_with_offers(
-                    json_prices,
-                    offer_prices,
-                    product_id_internal,
-                    region_names_map,
-                )
-
-                if precios_region:
-                    precio_global = int(min(precios_region.values()))
-                    mejor_region = min(precios_region, key=precios_region.get)
-                    print(
-                        f" ✓ Mínimo encontrado: ${precio_global} ({mejor_region})"
-                    )
-
-                    # Estructura única por producto (para cm_precios_minimos)
-                    row_data = {
-                        "id_producto": str(producto_id_csv),
-                        "nombre_producto": nombre,
-                        "numero_proveedores": num_providers,
-                        "link_producto": link,
-                        "precio_minimo_global": precio_global,
-                        "region_mejor_precio": mejor_region,
-                        # JSON con precios por región: { "Region Metropolitana": 1234, ... }
-                        "precios_region": precios_region,
-                    }
-
-                    resultados.append(row_data)
-                else:
-                    print(" ⚠ Sin precios válidos encontrados.")
-            else:
-                print(" ⚠ No se encontró jsonResult.")
-
-        except Exception as e:
-            print(f" ✗ Error: {e}")
-
-        time.sleep(1)
+        for fut in as_completed(futures):
+            try:
+                data = fut.result()
+                if data is not None:
+                    resultados.append(data)
+            except Exception as e:
+                print("✗ Error en thread: {}".format(e))
 
     if not resultados:
         print("✗ No se generaron resultados.")
         return None
 
-    print(f"\n[4/4] Guardando {len(resultados)} productos en Supabase...")
+    print("\n[4/4] Guardando {} productos en Supabase...".format(len(resultados)))
 
-    # Opcional: DataFrame para inspección local (no se escribe CSV)
+    # Opcional: DataFrame para inspección local
     df_final = pd.DataFrame(resultados)
 
     # Upsert en cm_precios_minimos
     chunk_size = 200
     for i in range(0, len(resultados), chunk_size):
         chunk = resultados[i : i + chunk_size]
-        supabase.table("cm_precios_minimos").upsert(
-            chunk,
-            on_conflict="id_producto",  # requiere UNIQUE(id_producto) en la tabla
-        ).execute()
+        (
+            supabase.table("cm_precios_minimos")
+            .upsert(chunk, on_conflict="id_producto")
+            .execute()
+        )
 
     print("✓ Listo: datos guardados/actualizados en cm_precios_minimos en Supabase")
     return df_final
 
 
 if __name__ == "__main__":
-    # Cambia max_products si quieres limitar la corrida en pruebas
-    process_products_with_prices(max_products=999999)
+    # max_products: cuántos productos leer de cm_productos
+    # max_workers: cuántos threads en paralelo (no subir demasiado para no saturar el sitio)
+    process_products_with_prices(max_products=999999, max_workers=8)
