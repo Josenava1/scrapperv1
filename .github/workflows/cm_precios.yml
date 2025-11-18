@@ -8,7 +8,7 @@ on:
 jobs:
   actualizar-precios:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # puede tardar más, sube si es necesario
+    timeout-minutes: 360   # puede tardar más, sube si es necesario
     concurrency:
       group: cm-precios
       cancel-in-progress: true
