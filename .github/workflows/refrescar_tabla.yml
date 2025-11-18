@@ -1,2 +1,1 @@
-      - name: Refrescar tabla cm_precios_region
-        run: python refresh_precios_region.py
+
