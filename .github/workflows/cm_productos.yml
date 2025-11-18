@@ -3,7 +3,7 @@ name: Convenio Marco - Productos
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 8 * * 1"   # ejemplo: lunes 08:00 UTC (ajusta a gusto)
+    - cron: "0 9 * * 1-5"   # ejemplo: lunes 08:00 UTC (ajusta a gusto)
 
 jobs:
   actualizar-productos:
