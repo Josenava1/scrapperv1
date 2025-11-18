@@ -32,3 +32,6 @@ jobs:
 
       - name: Run proyectoMPlvl2 (precios y ofertas)
         run: python proyectoMPlvl2.py
+
+      - name: Refrescar tabla cm_precios_region
+        run: python refresh_precios_region.py
