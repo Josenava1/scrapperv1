@@ -1,0 +1,38 @@
+name: Convenio Marco Scraper
+
+on:
+  # Ejecutar manualmente desde la pestaña "Actions"
+  workflow_dispatch:
+
+  # Ejecutar automáticamente todos los días a las 06:00 UTC
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  run-scrapers:
+    runs-on: ubuntu-latest
+
+    # Variables de entorno disponibles para todos los steps
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"  # asegura compatibilidad con todo tu código
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run proyectoMP (scrape productos)
+        run: python proyectoMP.py
+
+      - name: Run proyectoMPlvl2 (precios y ofertas)
+        run: python proyectoMPlvl2.py
